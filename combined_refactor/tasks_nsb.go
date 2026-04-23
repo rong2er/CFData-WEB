@@ -162,6 +162,9 @@ func sortNSBResults(results []iptestResult, speedTest int) {
 }
 
 func runNSBDownloadSpeed(ctx context.Context, ip string, port int, enableTLS bool, testURL string) (float64, string) {
+	const speedWindow = 8 * time.Second
+	const speedMaxBytes = 32 * 1024 * 1024
+
 	if strings.TrimSpace(testURL) == "" {
 		testURL = speedTestURL
 	}
@@ -187,12 +190,14 @@ func runNSBDownloadSpeed(ctx context.Context, ip string, port int, enableTLS boo
 			},
 			TLSHandshakeTimeout: 10 * time.Second,
 		},
-		Timeout: 15 * time.Second,
 	}
 
 	fullURL := fmt.Sprintf("%s%s%s", scheme, parsedURL.Host, parsedURL.RequestURI())
 
-	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+	speedCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(speedCtx, "GET", fullURL, nil)
 	if err != nil {
 		return 0, "测速请求构建失败: " + err.Error()
 	}
@@ -209,10 +214,70 @@ func runNSBDownloadSpeed(ctx context.Context, ip string, port int, enableTLS boo
 		return 0, "测速失败"
 	}
 
-	written, err := io.Copy(io.Discard, resp.Body)
-	if err != nil {
-		return 0, "测速下载失败: " + err.Error()
+	buf := make([]byte, 32*1024)
+	type readChunk struct {
+		n   int
+		err error
 	}
+	chunks := make(chan readChunk, 16)
+	readerDone := make(chan struct{})
+	safeGo("nsb-speed-reader", nil, func() {
+		defer close(readerDone)
+		for {
+			n, err := resp.Body.Read(buf)
+			select {
+			case chunks <- readChunk{n: n, err: err}:
+			case <-speedCtx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	})
+
+	windowTimer := time.NewTimer(speedWindow)
+	defer windowTimer.Stop()
+
+	var written int64
+	for {
+		select {
+		case <-ctx.Done():
+			cancel()
+			resp.Body.Close()
+			<-readerDone
+			return 0, "测速任务已终止"
+		case <-windowTimer.C:
+			cancel()
+			resp.Body.Close()
+			<-readerDone
+			goto done
+		case chunk := <-chunks:
+			if chunk.n > 0 {
+				written += int64(chunk.n)
+				if written >= speedMaxBytes {
+					cancel()
+					resp.Body.Close()
+					<-readerDone
+					goto done
+				}
+			}
+			if chunk.err != nil {
+				if chunk.err != io.EOF {
+					cancel()
+					resp.Body.Close()
+					<-readerDone
+					return 0, "测速下载失败: " + chunk.err.Error()
+				}
+				cancel()
+				resp.Body.Close()
+				<-readerDone
+				goto done
+			}
+		}
+	}
+
+done:
 	duration := time.Since(start)
 	if duration <= 0 {
 		return 0, "测速耗时异常: duration<=0"
