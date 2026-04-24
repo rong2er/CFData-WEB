@@ -1193,6 +1193,7 @@
                 }
             };
             ws.onclose = () => {
+                resetCurrentSpeedButton();
                 updateStatus('连接断开，3秒后重连...', false);
                 log('连接断开，正在重连...');
                 setTimeout(connect, 3000);
@@ -1522,7 +1523,11 @@
             const customUrl = document.getElementById('speedTestUrl').value.trim() || defaultSpeedTestUrl;
             if (!wsSend({ type: 'start_speed_test', data: { ip, port, url: customUrl } })) {
                 if (speedVal) speedVal.textContent = '连接未就绪';
-                currentSpeedTestingIP = null;
+                if (btn) {
+                    btn.textContent = '重新测速';
+                    btn.disabled = false;
+                }
+                currentSpeedTestingIP = '';
             }
         }
 
